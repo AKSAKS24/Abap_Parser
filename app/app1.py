@@ -1,4 +1,4 @@
-# abap_parser_app.py  (v1.12 – FORM names accept hyphens; allow dot/space after name)
+# abap_parser_app.py  (v1.12 – FORM names can contain hyphens, with or without parameter header)
 from fastapi import FastAPI
 from pydantic import BaseModel
 import re
@@ -16,18 +16,13 @@ class ABAPInput(BaseModel):
 FORM_NAME = r"(?P<name>[A-Za-z_][A-Za-z0-9_-]*)"
 
 # ---------- Robust, line-aware block patterns ----------
-# Notes:
-# - FORM now allows multi-line parameter header until the first dot.
-# - CLASS ... DEFINITION matches modifiers on the header.
-# - MODULE captures optional INPUT/OUTPUT mode.
-# - MACRO: DEFINE ... END-OF-DEFINITION.
-# - METHOD: supports constructor/class_constructor and iface~method; also matched top-level.
-
-# Case-insensitive, multiline, dotall everywhere
-
-# FORM: allow hyphens in name and allow *either space or dot* after the name
-FORM_BLOCK_RE = re.compile(
-    rf"(?ims)^\s*FORM\s+{FORM_NAME}(?=[\s\.])(?P<header>[\s\S]*?)\.\s*.*?^\s*ENDFORM\s*\.(?:[ \t]*\"[^\n]*)?\s*$"
+# FORM with possible multi-line parameter header
+FORM_BLOCK_RE   = re.compile(
+    rf"(?ims)^\s*FORM\s+{FORM_NAME}(?P<aftername>[\s\S]*?)\.\s*.*?^\s*ENDFORM\s*\.(?:[ \t]*\"[^\n]*)?\s*$"
+)
+# FORM with NO header, eg FORM FOO.
+FORM_BLOCK_NOHDR_RE = re.compile(
+    rf"(?ims)^\s*FORM\s+(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\.\s*.*?^\s*ENDFORM\s*\.(?:[ \t]*\"[^\n]*)?\s*$"
 )
 
 CLDEF_BLOCK_RE  = re.compile(
@@ -51,11 +46,13 @@ MACRO_BLOCK_RE  = re.compile(
 )
 
 # Combined regex for all top-level blocks.
-# IMPORTANT: the class implementation alt will swallow the whole class block, so
-# methods inside won’t be double-matched by the METHOD alt below.
+# The addition below (PATCH) handles 'FORM NAME.' without header.
 TOPLEVEL_RE = re.compile(
     rf"(?ims)"
-    rf"(^\s*FORM\s+{FORM_NAME}(?=[\s\.])[\s\S]*?\.\s*.*?^\s*ENDFORM\s*\.(?:[ \t]*\"[^\n]*)?\s*$)"
+    # FORM with multi-line PARAM header (legacy)
+    rf"(^\s*FORM\s+[A-Za-z_][A-Za-z0-9_-]*[\s\S]*?\.\s*.*?^\s*ENDFORM\s*\.(?:[ \t]*\"[^\n]*)?\s*$)"
+    # FORM with no header: FORM NAME.
+    r"|(^\s*FORM\s+[A-Za-z_][A-Za-z0-9_-]*\.\s*.*?^\s*ENDFORM\s*\.(?:[ \t]*\"[^\n]*)?\s*$)"  
     r"|(^\s*CLASS\s+\w+\s+DEFINITION\b[^\n]*\.\s*.*?^\s*ENDCLASS\s*\.(?:[ \t]*\"[^\n]*)?\s*$)"
     r"|(^\s*CLASS\s+\w+\s+IMPLEMENTATION\s*\.\s*.*?^\s*ENDCLASS\s*\.(?:[ \t]*\"[^\n]*)?\s*$)"
     r"|(^\s*FUNCTION\s+\w+\s*\.\s*.*?^\s*ENDFUNCTION\s*\.(?:[ \t]*\"[^\n]*)?\s*$)"
@@ -65,22 +62,18 @@ TOPLEVEL_RE = re.compile(
 )
 
 def _offsets_to_lines(src: str, start: int, end: int):
-    """Convert absolute character offsets into 1-based line numbers (inclusive)."""
     start_line = src.count("\n", 0, start) + 1 if src else 0
     end_line   = src.count("\n", 0, end) + 1 if src else 0
     return start_line, end_line
 
 def _emit_block(input_json: Dict[str, Any], block_text: str, start_off: int, end_off: int, results: List[Dict[str, Any]]):
-    """
-    Emits one or more result records for a matched block.
-    For class_impl: emit container-only code first, then full method items.
-    For others: emit single record as-is.
-    """
     src_all = input_json["code"]
     start_line, end_line = _offsets_to_lines(src_all, start_off, end_off)
 
-    # FORM
+    # FORM (with multiline header or normal) (PATCH: support no-header too)
     m = FORM_BLOCK_RE.match(block_text)
+    if not m:
+        m = FORM_BLOCK_NOHDR_RE.match(block_text)
     if m:
         name = m.group("name")
         results.append({
@@ -94,7 +87,6 @@ def _emit_block(input_json: Dict[str, Any], block_text: str, start_off: int, end
         })
         return
 
-    # CLASS DEFINITION
     m = CLDEF_BLOCK_RE.match(block_text)
     if m:
         name = m.group(1)
@@ -109,7 +101,6 @@ def _emit_block(input_json: Dict[str, Any], block_text: str, start_off: int, end
         })
         return
 
-    # CLASS IMPLEMENTATION (container + inner methods)
     m = CLIMP_BLOCK_RE.match(block_text)
     if m:
         class_name = m.group(1)
@@ -150,7 +141,6 @@ def _emit_block(input_json: Dict[str, Any], block_text: str, start_off: int, end
             })
         return
 
-    # FUNCTION
     m = FUNC_BLOCK_RE.match(block_text)
     if m:
         name = m.group(1)
@@ -165,7 +155,6 @@ def _emit_block(input_json: Dict[str, Any], block_text: str, start_off: int, end
         })
         return
 
-    # MODULE
     m = MODULE_BLOCK_RE.match(block_text)
     if m:
         name = m.group(1)
@@ -184,7 +173,6 @@ def _emit_block(input_json: Dict[str, Any], block_text: str, start_off: int, end
         results.append(rec)
         return
 
-    # MACRO
     m = MACRO_BLOCK_RE.match(block_text)
     if m:
         name = m.group(1)
@@ -218,10 +206,18 @@ def _normalize_code(s: str) -> str:
     """Normalize exotic whitespace: CRLF -> LF, NBSP -> space, LS/PS -> LF."""
     if not s:
         return ""
+    # CRLF/CR -> LF
     s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # Unicode non-breaking space to normal space
     s = s.replace("\u00A0", " ")
+    # Unicode line/paragraph separators to LF
     s = s.replace("\u2028", "\n").replace("\u2029", "\n")
     return s
+
+def _offsets_to_lines(src: str, start: int, end: int):
+    start_line = src.count("\n", 0, start) + 1 if src else 0
+    end_line   = src.count("\n", 0, end) + 1 if src else 0
+    return start_line, end_line
 
 def parse_abap_code_to_ndjson(input_json: dict):
     src = _normalize_code(input_json.get("code", "") or "")
@@ -275,16 +271,8 @@ def parse_abap_code_to_ndjson(input_json: dict):
             "code": src
         })
 
-    # ---- PATCH: enumerate raw_codeN types ----
-    raw_code_counter = 1
-    for rec in results:
-        if rec.get("type") == "raw_code":
-            rec["type"] = f"raw_code{raw_code_counter}"
-            raw_code_counter += 1
-    # ---- END PATCH ----
-
     return results
 
 @app.post("/parse_abap")
 def parse_abap(abap_input: ABAPInput):
-    return parse_abap_code_to_ndjson(abap_input.dict())
+    return parse_abap_code_to_ndjson(abap_input.dict())           
